@@ -120,6 +120,25 @@ static void testScroll() {
   CHECK_EQ(first, 0);
 }
 
+// --- idle timeout --------------------------------------------------------------------------------------------
+static void testElapsed() {
+  // Regression (seen in a serial capture: "screen wake" and "screen sleep" in the same millisecond): the activity
+  // stamp can be NEWER than the loop's `now`. That must read as "not idle", not as 49 days of idleness.
+  CHECK(!ctl::elapsedMs(1000, 1001, 60000));
+  CHECK(!ctl::elapsedMs(1000, 1005, 60000));
+  CHECK(!ctl::elapsedMs(1000, 1000, 0));
+  CHECK(ctl::elapsedMs(2000, 1000, 500));
+  CHECK(!ctl::elapsedMs(2000, 1000, 1000));        // strictly more than the timeout
+  CHECK(ctl::elapsedMs(2001, 1000, 1000));
+  // millis() wraps at 2^32 (after 49 days): 356 ms have passed between these two values
+  CHECK(ctl::elapsedMs(100, 0xFFFFFF00u, 300));
+  CHECK(!ctl::elapsedMs(100, 0xFFFFFF00u, 400));
+  // the longest configurable timeout (uint16 seconds) still fits the signed comparison
+  const uint32_t longest = 65535u * 1000u;
+  CHECK(!ctl::elapsedMs(5000000, 5000000 - 1000, longest));
+  CHECK(ctl::elapsedMs(5000000, 5000000 - longest - 1, longest));
+}
+
 // --- JD9853 init table ------------------------------------------------------------------------------------
 struct Cmd { uint8_t cmd, n, delay5; const uint8_t* data; };
 
@@ -222,6 +241,7 @@ int main() {
   testTouchRelease();
   testTouchClamps();
   testScroll();
+  testElapsed();
   testInitTable();
   testOrderPresetsEmpty();
   testOrderPresetsNoPlaylists();
