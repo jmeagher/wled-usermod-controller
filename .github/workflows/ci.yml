@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Push runs only on main (after a merge). Branches are covered by the pull_request event; triggering on every
+  # branch push as well would run the whole firmware matrix twice per commit on a PR branch.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   schedule:
     - cron: '0 5 * * 1'   # weekly: early warning when WLED main changes under us

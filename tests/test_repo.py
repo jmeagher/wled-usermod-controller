@@ -94,6 +94,15 @@ class BuildFiles(unittest.TestCase):
         if wf.exists():
             self.assertEqual(set(SHA.findall(wf.read_text())), pin, "CI builds a different WLED commit than the scripts")
 
+    def test_ci_does_not_run_twice_per_pr_commit(self):
+        wf = ROOT / ".github" / "workflows" / "ci.yml"
+        if wf.exists():
+            text = wf.read_text()
+            self.assertIn("pull_request:", text)
+            # `push` on every branch plus `pull_request` runs everything twice for each commit on a PR branch.
+            self.assertNotRegex(text, r'push:\s*\n\s*branches:\s*\[\s*"\*\*"\s*\]')
+            self.assertRegex(text, r"push:\s*\n\s*branches:\s*\[main\]")
+
     def test_workflow_env_exists(self):
         wf = ROOT / ".github" / "workflows" / "ci.yml"
         if wf.exists():
