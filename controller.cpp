@@ -284,6 +284,7 @@ class ControllerUsermod : public Usermod {
   // pending (debounced) remote brightness
   uint32_t briSendAt = 0; uint32_t briSendIp = 0; int16_t briSendVal = -1;
 
+  char wifiSsid[33] = {}, wifiIp[16] = {};   // cached in refreshLocal (WiFi.SSID() allocates)
   uint32_t regionSig[5] = {};          // header + 4 rows; skip redraw when unchanged
   uint32_t pickSig = 0;
 
@@ -296,25 +297,35 @@ class ControllerUsermod : public Usermod {
   bool touching = false, tIgnore = false, tMoved = false, tSlider = false;
   int tStartX = 0, tStartY = 0, tLastX = 0, tLastY = 0, tAccum = 0;
   Region tRegion = R_NONE;             // row being pressed (highlight + tap target)
-  uint32_t lastTouchRead = 0, touchDownAt = 0;
+  uint32_t lastTouchRead = 0, touchDownAt = 0, lastTouchReset = 0;
+  uint8_t touchFails = 0;
+
+  int i2cErr = 0;                      // last failure: Wire.endTransmission() code, or 100 + bytes received
 
   bool i2cRead(uint8_t reg, uint8_t* out, uint8_t n) {
     Wire.beginTransmission(kTouchAddr);
     Wire.write(reg);
-    if (Wire.endTransmission() != 0) return false;
-    if (Wire.requestFrom(kTouchAddr, n) != n) return false;
+    if ((i2cErr = Wire.endTransmission()) != 0) return false;
+    const uint8_t got = Wire.requestFrom(kTouchAddr, n);
+    if (got != n) { i2cErr = 100 + got; return false; }
     for (uint8_t i = 0; i < n; i++) out[i] = Wire.read();
+    i2cErr = 0;
     return true;
+  }
+
+  void touchReset() {                  // reset sequence from Waveshare's driver
+    if (pinTrst < 0) return;
+    CTL_LOG("[ctl] %lu touch reset begin\n", (unsigned long)millis());
+    pinMode(pinTrst, OUTPUT);
+    digitalWrite(pinTrst, LOW);  delay(200);
+    digitalWrite(pinTrst, HIGH); delay(300);
+    CTL_LOG("[ctl] %lu touch reset end\n", (unsigned long)millis());
   }
 
   bool touchInit() {
     if (pinTsda < 0 || pinTscl < 0) return false;
     Wire.begin(pinTsda, pinTscl, 400000);
-    if (pinTrst >= 0) {                // reset sequence from Waveshare's driver
-      pinMode(pinTrst, OUTPUT);
-      digitalWrite(pinTrst, LOW);  delay(200);
-      digitalWrite(pinTrst, HIGH); delay(300);
-    }
+    touchReset();
     if (pinTint >= 0) {
       pinMode(pinTint, INPUT_PULLUP);
       attachInterrupt(pinTint, onTouchInt, FALLING);
@@ -325,13 +336,41 @@ class ControllerUsermod : public Usermod {
     return ok;
   }
 
-  // Read the controller when it signalled (INT) or while a finger is down; emit DOWN/MOVE/UP.
+  // Read the controller when it signalled (INT edge), while INT is held low (the chip's INT is a latched level,
+  // so an edge can be missed), while a finger is down, and every 150 ms while the screen is dark. Emits DOWN/MOVE/UP.
+  // If the chip stops answering it is reset (at most every 10 s).
   void pollTouch(uint32_t now) {
-    if (!touchOk || !(gTouchInt || touching) || now - lastTouchRead < 12) return;
+    if (!touchOk) return;
+    const bool intLow = pinTint >= 0 && digitalRead(pinTint) == LOW;
+    const bool due = gTouchInt || touching || intLow || (!awake && now - lastTouchRead >= 150);
+    if (!due || now - lastTouchRead < 12) return;
     lastTouchRead = now;
+    const bool flag = gTouchInt;
     gTouchInt = false;
     uint8_t d[14] = {};
-    if (!i2cRead(kTouchDataReg, d, 14)) return;
+    const bool readOk = i2cRead(kTouchDataReg, d, 14);
+#ifdef CTL_DEBUG
+    {   // one line per change of state (not per read), so the dark-screen poll does not flood the log
+      const uint32_t sig = readOk | (intLow << 1) | (flag << 2) | (awake << 3) | (touching << 4) |
+                           (uint32_t(readOk ? d[1] : 255) << 8) | (uint32_t(i2cErr) << 16);
+      static uint32_t lastSig = 0xFFFFFFFF;
+      if (sig != lastSig) {
+        lastSig = sig;
+        CTL_LOG("[ctl] %lu read ok=%d err=%d int=%d flag=%d awake=%d touching=%d raw=%02x %02x %02x %02x %02x %02x\n",
+                (unsigned long)now, readOk, i2cErr, intLow, flag, awake, touching, d[0], d[1], d[2], d[3], d[4], d[5]);
+      }
+    }
+#endif
+    if (!readOk) {
+      if (++touchFails >= 5 && now - lastTouchReset > 10000) {
+        CTL_LOG("[ctl] touch not answering, resetting it\n");
+        lastTouchReset = now;
+        touchFails = 0;
+        touchReset();
+      }
+      return;
+    }
+    touchFails = 0;
     const uint8_t n = d[1];
     if (n >= 1 && n <= 5) {
       int x = kW - 1 - (((d[2] & 0x0F) << 8) | d[3]);   // same mapping as Waveshare's driver, rotation 0
@@ -413,6 +452,12 @@ class ControllerUsermod : public Usermod {
     d.ps = currentPreset;
     d.stateKnown = true;
     d.reachable = true;
+    if (WLED_CONNECTED) {
+      strlcpy(wifiSsid, WiFi.SSID().c_str(), sizeof(wifiSsid));
+      strlcpy(wifiIp, WLEDNetwork.localIP().toString().c_str(), sizeof(wifiIp));
+    } else {
+      wifiSsid[0] = wifiIp[0] = 0;
+    }
   }
 
   void refreshDevices(uint32_t now) {
@@ -455,11 +500,14 @@ class ControllerUsermod : public Usermod {
   }
 
   void schedulePolls(uint32_t now) {
-    if (!awake || !WLED_CONNECTED || now - lastPoll < kPollMs) return;
-    lastPoll = now;
+    if (!awake || !WLED_CONNECTED) return;
     Lock l(mtx);
     Dev& d = devs[selIndexLocked()];
     if (d.local) return;
+    // Until the first reply the controls are blank, so ask again every 500 ms instead of every kPollMs.
+    const uint32_t interval = d.stateKnown ? kPollMs : 500;
+    if (now - lastPoll < interval) return;
+    lastPoll = now;
     Req* r = slotFor(d.ip);
     if (r) r->poll = true;
   }
@@ -518,13 +566,14 @@ class ControllerUsermod : public Usermod {
 
   void wake() {
     lastActivity = millis();
-    if (!awake) { awake = true; digitalWrite(pinBl, HIGH); resetDrawCache(); }
+    if (!awake) { awake = true; digitalWrite(pinBl, HIGH); resetDrawCache(); CTL_LOG("[ctl] %lu screen wake\n", (unsigned long)millis()); }
   }
 
   void sleepScreen() {
     awake = false;
     screen = SCR_MAIN;
     digitalWrite(pinBl, LOW);
+    CTL_LOG("[ctl] %lu screen sleep\n", (unsigned long)millis());
   }
 
   void resetDrawCache() {
@@ -534,11 +583,16 @@ class ControllerUsermod : public Usermod {
 
   void activate(Region r, uint32_t now) {
     switch (r) {
-      case R_POWER: togglePower(now); break;
+      case R_POWER: if (selStateKnown()) togglePower(now); break;
       case R_DEVICE: openPicker(SCR_PICK_DEVICE, now); break;
       case R_PRESET: openPicker(SCR_PICK_PRESET, now); break;
       default: break;
     }
+  }
+
+  bool selStateKnown() {
+    Lock l(mtx);
+    return devs[selIndexLocked()].stateKnown;
   }
 
   void openPicker(Screen s, uint32_t now) {
@@ -583,6 +637,7 @@ class ControllerUsermod : public Usermod {
     const PickItem it = pickItems[idx];
     if (screen == SCR_PICK_DEVICE) {
       selIp = it.ip;
+      lastPoll = 0;                    // poll the newly selected device on the next housekeeping pass
       if (it.ip == 0) localPresetsDirty = true;
       else { Lock l(mtx); ensurePresetsLocked(devs[selIndexLocked()], now, false); }
     } else {
@@ -655,6 +710,7 @@ class ControllerUsermod : public Usermod {
     const int v = constrain(1 + (x - kTrackX) * 254 / kTrackW, 1, 255);
     Lock l(mtx);
     Dev& d = devs[selIndexLocked()];
+    if (!d.stateKnown) return;         // blank controls: do not overwrite a device we have not heard from
     if (d.bri == v && d.on) return;
     d.bri = v;
     d.lastCmdAt = now;
@@ -734,6 +790,7 @@ class ControllerUsermod : public Usermod {
     uint32_t sigs[5];
     uint32_t hdr[3] = {uint32_t(wifi), uint32_t(v.devCount), uint32_t(touchOk)};
     sigs[0] = hashBytes(hdr, sizeof(hdr), hashBytes(statusMsg, sizeof(statusMsg)));
+    sigs[0] = hashBytes(wifiSsid, sizeof(wifiSsid), hashBytes(wifiIp, sizeof(wifiIp), sigs[0]));
     for (int r = 0; r < 4; r++) {
       uint32_t flag = tRegion == r ? 1u : 0u;
       sigs[1 + r] = hashBytes(&flag, sizeof(flag), base);
@@ -747,18 +804,22 @@ class ControllerUsermod : public Usermod {
     canvas->fillScreen(C_BG);
     canvas->setFont(nullptr);
     canvas->setTextSize(1);
-    char line[40];
+    char line[48];
     if (statusMsg[0]) { canvas->setTextColor(C_ERR); canvas->setCursor(4, 11); canvas->print(statusMsg); }
     else {
-      if (wifi) snprintf(line, sizeof(line), "WiFi %s", WLEDNetwork.localIP().toString().c_str());
+      // Three 8 px lines: network name, address, device count. 28 characters fit across the 172 px panel.
+      if (wifi) snprintf(line, sizeof(line), "WiFi: %.22s", wifiSsid[0] ? wifiSsid : "(unknown)");
       else snprintf(line, sizeof(line), apActive ? "AP mode - local only" : "No WiFi - local only");
       canvas->setTextColor(wifi ? C_ON : C_ERR);
-      canvas->setCursor(4, 6);
+      canvas->setCursor(4, 2);
       canvas->print(line);
+      canvas->setTextColor(C_DIM);
+      canvas->setCursor(4, 12);
+      canvas->print(wifi ? wifiIp : "-");
       snprintf(line, sizeof(line), touchOk ? "%u device%s" : "touch not found | %u device%s",
                unsigned(v.devCount), v.devCount == 1 ? "" : "s");
       canvas->setTextColor(touchOk ? C_DIM : C_ERR);
-      canvas->setCursor(4, 18);
+      canvas->setCursor(4, 22);
       canvas->print(line);
     }
     tft->drawRGBBitmap(0, 0, canvas->getBuffer(), kW, kHeaderH);
@@ -787,6 +848,10 @@ class ControllerUsermod : public Usermod {
       }
       case R_POWER: {
         fitText(*canvas, "POWER", x, 17, maxW, C_DIM);
+        if (!v.stateKnown) {            // blank pill until the real state arrives
+          canvas->fillRoundRect(x, 24, 96, 34, 17, C_TRACK);
+          break;
+        }
         canvas->fillRoundRect(x, 24, 96, 34, 17, v.on ? C_ON : C_OFF);
         canvas->setFont(&FreeSansBold12pt7b);
         fitText(*canvas, v.on ? "ON" : "OFF", x + (v.on ? 34 : 27), 48, 80, C_TEXT);
@@ -795,18 +860,38 @@ class ControllerUsermod : public Usermod {
       case R_PRESET: {
         fitText(*canvas, "PRESET  >", x, 17, maxW, C_DIM);
         const char* shown = v.psName[0] ? v.psName : "-";
-        if (v.presetsFetching && !v.presetsLoaded) shown = "loading...";
+        if (!v.stateKnown) shown = v.reachable ? "loading..." : "unreachable";   // active preset is part of the state
+        else if (v.presetsFetching && !v.presetsLoaded) shown = "loading...";
         else if (v.presetsLoaded && !v.presetCount) shown = "no presets";
         canvas->setFont(&FreeSansBold12pt7b);
         fitText(*canvas, shown, x, 46, maxW, C_TEXT);
         break;
       }
       case R_BRI: {
-        snprintf(buf, sizeof(buf), "BRIGHTNESS  %d%%", (v.bri * 100 + 127) / 255);
-        fitText(*canvas, buf, x, 22, maxW, C_DIM);
+        fitText(*canvas, "BRIGHTNESS", x, 22, maxW, C_DIM);
         canvas->fillRoundRect(kTrackX, kTrackY, kTrackW, kTrackH, 12, C_TRACK);
-        const int fillW = std::max(kTrackH, kTrackW * v.bri / 255);
-        canvas->fillRoundRect(kTrackX, kTrackY, fillW, kTrackH, 12, v.on ? C_BAR : C_DIM);
+        if (!v.stateKnown) {            // empty track and a message: never draw the placeholder level
+          canvas->setFont(&FreeSans9pt7b);
+          const char* msg = v.reachable ? "loading..." : "unreachable";
+          int16_t mx, my; uint16_t mw, mh;
+          canvas->getTextBounds(msg, 0, 0, &mx, &my, &mw, &mh);
+          canvas->setTextColor(v.reachable ? C_DIM : C_ERR);
+          canvas->setCursor(kTrackX + (kTrackW - int(mw)) / 2 - mx, kTrackY + (kTrackH - int(mh)) / 2 - my);
+          canvas->print(msg);
+          break;
+        }
+        // Proportional fill. The corner radius shrinks for narrow fills (a fixed radius needs >= 24 px of width),
+        // so 2% looks like 2% instead of a rounded blob a third of the track wide.
+        const int fillW = std::max(1, kTrackW * v.bri / 255);
+        canvas->fillRoundRect(kTrackX, kTrackY, fillW, kTrackH, std::min(12, fillW / 2), v.on ? C_BAR : C_DIM);
+        // The level as a percentage, centred on the bar.
+        snprintf(buf, sizeof(buf), "%d%%", (v.bri * 100 + 127) / 255);
+        canvas->setFont(&FreeSansBold12pt7b);
+        int16_t bx, by; uint16_t bw, bh;
+        canvas->getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
+        canvas->setTextColor(C_TEXT);
+        canvas->setCursor(kTrackX + (kTrackW - int(bw)) / 2 - bx, kTrackY + (kTrackH - int(bh)) / 2 - by);
+        canvas->print(buf);
         break;
       }
       default: break;

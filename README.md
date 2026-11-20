@@ -18,8 +18,13 @@ Main screen (portrait):
 | Preset row | tap: full-screen preset list |
 | Brightness (bottom) | touch or drag anywhere in the area |
 
+The header shows the WiFi network name, the IP address and the number of devices found. For another device, the Power,
+Preset and Brightness controls stay blank ("loading..." or "unreachable") until its real state arrives, and ignore touches
+until then. The brightness bar fills in proportion to the level and shows the percentage on it.
+
 Lists: drag to scroll, tap an item to choose it, tap **X** (top right) to go back. The screen sleeps after 60 s (the
-touch that wakes it does nothing else); an open list closes after 20 s idle.
+touch that wakes it does nothing else); an open list closes after 20 s idle. The touch chip is also read while INT is held
+low and while the screen is dark, and is reset if it stops answering.
 
 The local device works with no WiFi: power, presets and brightness call WLED directly. Other devices come from WLED's
 node list (UDP broadcasts, so *Sync > Show other WLED devices* must be on, which is the default) plus an mDNS scan for
