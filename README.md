@@ -1,5 +1,7 @@
 # wled-usermod-controller
 
+[![CI](https://github.com/jmeagher/wled-usermod-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/jmeagher/wled-usermod-controller/actions/workflows/ci.yml)
+
 A [WLED](https://github.com/wled/WLED) usermod that turns a **Waveshare ESP32-C6-Touch-LCD-1.47** (172x320 JD9853 LCD,
 AXS5106L capacitive touch) into a stand-alone touch controller for **this WLED and every other WLED on the LAN**:
 power, preset and brightness.
@@ -61,6 +63,24 @@ Defaults (Waveshare docs and demo), editable under *Config > Usermods > Controll
 
 The LCD is a JD9853: ST7789-compatible but it needs vendor registers, kept in `jd9853_init.h` (generated from Waveshare's
 demo). Build with `-D CTL_LCD_PLAIN_ST7789` for a plain ST7789 panel.
+
+## Tests and CI
+
+```sh
+tests/run.sh                                   # desktop logic tests (ASan + UBSan, warnings are errors)
+python3 -I -m unittest discover -s tests -v    # repository checks
+```
+
+The logic that can be tested without a board lives in `ctl_logic.h` (brightness bar, touch decoding, list scrolling);
+`tests/test_logic.cpp` checks it, including real touch reports captured from the board, and sanity-checks the JD9853
+init table. `tests/test_repo.py` checks things a compile does not: every config key written is read back, the pins in
+this README match the code, the pinned WLED commit is the same in the scripts and in CI, `BTNPIN=-1` is kept, scripts
+pass `bash -n` and shellcheck.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs those, then builds the firmware against the pinned WLED in three
+variants (default, `-D CTL_DEBUG`, `-D CTL_LCD_PLAIN_ST7789`) so flag-only code still compiles, and fails if flash use
+passes 90 % of the app partition. A weekly job builds against WLED `main` as an early warning (allowed to fail). CI
+cannot test the screen or touch: that still needs a board.
 
 ## Not done
 

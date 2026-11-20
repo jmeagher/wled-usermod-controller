@@ -15,7 +15,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 lsf="${LSF_DIR:-$(cd "$here/../wled-usermod-ls-formula" && pwd)}"
 dir="${WLED_DIR:-$HOME/.cache/wled-usermod-controller/wled}"
-ref="${WLED_REF:-fffa05a765d41d7126b66ab5a3d1ce1f41e7d11e}"   # same pin as the ls-formula installer
+# The WLED commit is pinned in scripts/dev-setup.sh (override with WLED_REF); it matches the ls-formula installer.
 action="${1:-all}"
 # The controller is touch-only now, so the only supported board is the Waveshare ESP32-C6-Touch-LCD-1.47
 # (8 MB flash). Pin defaults live in controller.cpp (LCD SCLK 1 / MOSI 2 / CS 14 / DC 15 / RST 22 / BL 23,

@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <vector>
 
+#include "ctl_logic.h"      // pure logic (slider, touch decode, scrolling), unit-tested on the host
+
 #ifndef ARDUINO_ARCH_ESP32
   #error "usermod controller needs an ESP32"
 #endif
@@ -371,12 +373,9 @@ class ControllerUsermod : public Usermod {
       return;
     }
     touchFails = 0;
-    const uint8_t n = d[1];
-    if (n >= 1 && n <= 5) {
-      int x = kW - 1 - (((d[2] & 0x0F) << 8) | d[3]);   // same mapping as Waveshare's driver, rotation 0
-      int y = ((d[4] & 0x0F) << 8) | d[5];
-      x = constrain(x, 0, kW - 1);
-      y = constrain(y, 0, kH - 1);
+    const ctl::TouchPoint pt = ctl::decodeTouch(d, kW, kH);
+    if (pt.n) {
+      const int x = pt.x, y = pt.y;
       if (!touching) { touching = true; touchDownAt = now; onTouch(T_DOWN, x, y, now); }
       else if (x != tLastX || y != tLastY) onTouch(T_MOVE, x, y, now);
     } else if (touching) {
@@ -621,10 +620,7 @@ class ControllerUsermod : public Usermod {
   int maxFirst() const { return std::max(0, int(pickItems.size()) - kVisible); }
 
   void scrollBy(int dy) {
-    tAccum += dy;
-    while (tAccum <= -kItemH) { pickFirst++; tAccum += kItemH; }   // drag up: later items
-    while (tAccum >= kItemH)  { pickFirst--; tAccum -= kItemH; }
-    pickFirst = constrain(pickFirst, 0, maxFirst());
+    ctl::scrollList(pickFirst, tAccum, dy, kItemH, maxFirst());
   }
 
   void pickAt(int x, int y, uint32_t now) {
@@ -707,7 +703,7 @@ class ControllerUsermod : public Usermod {
 
   // Slider: x across the track maps to 1..255 (never 0: Power is the off switch).
   void setBrightnessFromX(int x, uint32_t now) {
-    const int v = constrain(1 + (x - kTrackX) * 254 / kTrackW, 1, 255);
+    const int v = ctl::briFromTrackX(x, kTrackX, kTrackW);
     Lock l(mtx);
     Dev& d = devs[selIndexLocked()];
     if (!d.stateKnown) return;         // blank controls: do not overwrite a device we have not heard from
@@ -882,10 +878,10 @@ class ControllerUsermod : public Usermod {
         }
         // Proportional fill. The corner radius shrinks for narrow fills (a fixed radius needs >= 24 px of width),
         // so 2% looks like 2% instead of a rounded blob a third of the track wide.
-        const int fillW = std::max(1, kTrackW * v.bri / 255);
-        canvas->fillRoundRect(kTrackX, kTrackY, fillW, kTrackH, std::min(12, fillW / 2), v.on ? C_BAR : C_DIM);
+        const int fillW = ctl::fillWidth(v.bri, kTrackW);
+        canvas->fillRoundRect(kTrackX, kTrackY, fillW, kTrackH, ctl::fillRadius(fillW), v.on ? C_BAR : C_DIM);
         // The level as a percentage, centred on the bar.
-        snprintf(buf, sizeof(buf), "%d%%", (v.bri * 100 + 127) / 255);
+        snprintf(buf, sizeof(buf), "%d%%", ctl::percentOf(v.bri));
         canvas->setFont(&FreeSansBold12pt7b);
         int16_t bx, by; uint16_t bw, bh;
         canvas->getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
