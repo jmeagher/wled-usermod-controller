@@ -13,6 +13,13 @@ on:
 permissions:
   contents: read
 
+# An explicit `shell: bash` runs steps with `bash -eo pipefail`. The default shell has no pipefail, so a failed
+# `pio run | tee build.log` passed and the build failure surfaced as a misleading flash-size error in the next step.
+# Third-party actions are pinned to full commit SHAs (version in the comment).
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -21,10 +28,11 @@ jobs:
   host:
     name: Logic and repository tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with: { persist-credentials: false }
-      - name: Slider, touch decoding, scrolling and JD9853 init table (ASan + UBSan, warnings are errors)
+      - name: Logic, HTTP head, device list, preset JSON vs ArduinoJson 6.18.1, JD9853 table (ASan + UBSan, -Werror)
         run: tests/run.sh
       - name: Repository checks (config round trip, pins vs docs, pinned WLED commit, scripts)
         run: python3 -I -m unittest discover -s tests -v
@@ -32,6 +40,7 @@ jobs:
   firmware:
     name: Firmware (${{ matrix.name }}, WLED ${{ matrix.label }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
@@ -49,25 +58,25 @@ jobs:
       # WLED and the usermod are SIBLING directories. A WLED tree inside the usermod directory makes PlatformIO fold
       # WLED's own libs into the usermod and the build fails with "wled_ADCmanager.h: No such file or directory".
       - name: Checkout usermod
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with: { path: usermod, persist-credentials: false }
       - name: Checkout WLED
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with: { repository: wled/WLED, ref: "${{ matrix.ref }}", path: WLED, persist-credentials: false }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4.4.0
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: WLED/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
         with: { python-version: "3.12" }
       - name: Cache PlatformIO packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830   # v4.3.0
         with:
           path: ~/.platformio
           key: pio-${{ runner.os }}-${{ hashFiles('WLED/platformio.ini', 'usermod/library.json') }}
           restore-keys: pio-${{ runner.os }}-
-      - run: pip install platformio
+      - run: pip install platformio==6.2.0
       - name: Build the web UI (generates headers the firmware includes)
         working-directory: WLED
         run: npm ci && npm run build
@@ -87,7 +96,7 @@ jobs:
           awk -v p="$pct" 'BEGIN { exit !(p != "" && p+0 <= 90) }' || { echo "flash use ${pct}% exceeds 90%"; exit 1; }
       - name: Keep the firmware image
         if: matrix.name == 'default' && matrix.label == 'pinned'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
         with:
           name: firmware-ctl_esp32c6_8MB
           path: WLED/.pio/build/ctl_esp32c6_8MB/firmware.bin

@@ -81,6 +81,10 @@ class BuildFiles(unittest.TestCase):
         # Without BTNPIN=-1 WLED claims GPIO 0 (battery sense on this board) as its own button.
         self.assertIn("-D BTNPIN=-1", sec["build_flags"])
 
+    def test_install_script_debug_flag_is_explicit(self):
+        # ${CTL_DEBUG:+...} turned debug logging ON for CTL_DEBUG=0.
+        self.assertNotIn("${CTL_DEBUG:+", (ROOT / "scripts" / "install.sh").read_text())
+
     def test_install_script_keeps_btnpin(self):
         self.assertIn("-D BTNPIN=-1", (ROOT / "scripts" / "install.sh").read_text())
 
@@ -92,7 +96,9 @@ class BuildFiles(unittest.TestCase):
         self.assertEqual(SHA.findall((ROOT / "scripts" / "install.sh").read_text()), [])
         wf = ROOT / ".github" / "workflows" / "ci.yml"
         if wf.exists():
-            self.assertEqual(set(SHA.findall(wf.read_text())), pin, "CI builds a different WLED commit than the scripts")
+            # `uses:` lines carry the SHAs of pinned actions, not WLED commits.
+            text = "\n".join(l for l in wf.read_text().splitlines() if "uses:" not in l)
+            self.assertEqual(set(SHA.findall(text)), pin, "CI builds a different WLED commit than the scripts")
 
     def test_ci_does_not_run_twice_per_pr_commit(self):
         wf = ROOT / ".github" / "workflows" / "ci.yml"
@@ -102,6 +108,23 @@ class BuildFiles(unittest.TestCase):
             # `push` on every branch plus `pull_request` runs everything twice for each commit on a PR branch.
             self.assertNotRegex(text, r'push:\s*\n\s*branches:\s*\[\s*"\*\*"\s*\]')
             self.assertRegex(text, r"push:\s*\n\s*branches:\s*\[main\]")
+
+    def test_ci_actions_pinned_and_steps_fail_fast(self):
+        wf = ROOT / ".github" / "workflows" / "ci.yml"
+        if not wf.exists():
+            return
+        text = wf.read_text()
+        for m in re.finditer(r"uses:\s*(\S+)", text):
+            ref = m.group(1).split("@")[-1]
+            self.assertRegex(ref, r"^[0-9a-f]{40}$", f"{m.group(1)}: pin third-party actions to a full commit SHA")
+        # Without pipefail `pio run | tee build.log` hides a failed build.
+        self.assertRegex(text, r"defaults:\s*\n\s*run:\s*\n\s*shell:\s*bash")
+        self.assertRegex(text, r"pip install platformio==\d+\.\d+\.\d+")
+        self.assertEqual(text.count("timeout-minutes:"), text.count("runs-on:"), "every job needs timeout-minutes")
+
+    def test_readme_documents_config_keys(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("lan sweep", readme)
 
     def test_workflow_env_exists(self):
         wf = ROOT / ".github" / "workflows" / "ci.yml"
