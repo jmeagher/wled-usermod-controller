@@ -30,7 +30,10 @@ low and while the screen is dark, and is reset if it stops answering.
 
 The local device works with no WiFi: power, presets and brightness call WLED directly. Other devices come from WLED's
 node list (UDP broadcasts, so *Sync > Show other WLED devices* must be on, which is the default) plus an mDNS scan for
-`_wled._tcp`. They are controlled with `POST /json/state`, from a separate task so the UI never blocks. Their presets
+`_wled._tcp`, plus a unicast sweep of the local /24 (a short `GET /json/info` per address, about a minute per pass,
+repeated every minute). Both multicast sources fail on APs or mesh nodes that do not deliver multicast/broadcast
+frames to their clients, and some mesh setups do that for only some nodes, so a device can see an empty node list
+depending on which AP it joined. The sweep needs only ordinary unicast, so every device is still found. They are controlled with `POST /json/state`, from a separate task so the UI never blocks. Their presets
 are read from `/presets.json`.
 
 ## Build and install

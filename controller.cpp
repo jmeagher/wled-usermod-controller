@@ -64,6 +64,9 @@ constexpr int kDevY = kHeaderH, kPowY = kDevY + kRowH, kPsY = kPowY + kRowH, kBr
 constexpr int kPickTitleH = 36, kItemH = 44, kVisible = (kH - kPickTitleH) / kItemH;   // 6
 constexpr int kTrackX = 10, kTrackW = kW - 20, kTrackY = 34, kTrackH = 50;
 constexpr uint32_t kPollMs = 2500, kMdnsMs = 30000, kPresetRetryMs = 10000;
+constexpr uint32_t kSweepIdleMs = 60000;    // pause between unicast sweeps of the local /24
+constexpr uint16_t kSweepProbeMs = 350;   // connect timeout per address; a device at -88 dBm needs more than 200 ms
+constexpr uint8_t kMdnsMaxMissed = 3;   // a device that answers mDNS only some of the time (weak WiFi) stays listed
 constexpr uint32_t kBriDebounceMs = 150, kPickIdleMs = 20000;
 constexpr uint8_t kTouchAddr = 0x63, kTouchIdReg = 0x08, kTouchDataReg = 0x01;
 
@@ -100,7 +103,7 @@ struct Req {
   uint32_t briDueAt = 0;         // debounce: a lone brightness request waits until this time
 };
 
-struct MdnsHit { uint32_t ip; char name[33]; };
+struct MdnsHit { uint32_t ip; char name[33]; uint8_t missed; };   // missed: consecutive scans that did not see it
 
 struct PickItem { char label[34]; char sub[20]; uint32_t ip; uint8_t id; bool current; };
 
@@ -250,6 +253,13 @@ class ControllerUsermod : public Usermod {
   std::vector<Dev> devs;               // [0] is this device, the rest sorted by name
   Req reqs[4];
   std::vector<MdnsHit> mdnsHits;
+  // Unicast fallback. Some APs/mesh nodes never deliver multicast or broadcast to their clients, which silences
+  // both the WLED node list (UDP broadcast) and mDNS. Unicast HTTP still works there, so when neither source has
+  // found anything the worker probes the local /24 for WLED devices. missed counts whole sweeps, not scans.
+  std::vector<MdnsHit> sweepHits;
+  volatile uint8_t nodeCount = 0;   // Nodes.size(), published from loop() because Nodes is WLED state
+  uint16_t sweepHost = 0;           // next last-octet to probe; 0 = no sweep in progress
+  uint32_t sweepDoneAt = 0;         // when the last sweep ended
 
   struct Lock {
     SemaphoreHandle_t m;
@@ -467,6 +477,7 @@ class ControllerUsermod : public Usermod {
       return;
     }
     const uint32_t self = (uint32_t)WLEDNetwork.localIP();
+    nodeCount = Nodes.size() > 255 ? 255 : Nodes.size();
     struct Cand { uint32_t ip; String name; bool hasOn; bool on; };
     std::vector<Cand> cands;
     for (auto& kv : Nodes) {
@@ -475,6 +486,11 @@ class ControllerUsermod : public Usermod {
     }
     Lock l(mtx);
     for (auto& h : mdnsHits) {
+      bool dup = h.ip == self;
+      for (auto& c : cands) dup |= c.ip == h.ip;
+      if (!dup) cands.push_back({h.ip, String(h.name), false, false});
+    }
+    for (auto& h : sweepHits) {
       bool dup = h.ip == self;
       for (auto& c : cands) dup |= c.ip == h.ip;
       if (!dup) cands.push_back({h.ip, String(h.name), false, false});
@@ -496,6 +512,19 @@ class ControllerUsermod : public Usermod {
     });
     devs.swap(next);
     selIndexLocked();
+#ifdef CTL_DEBUG
+    {
+      static uint32_t lastSig = 0;
+      uint32_t sig = devs.size();
+      for (auto& d : devs) sig = sig * 31 + d.ip;
+      if (sig != lastSig) {
+        lastSig = sig;
+        CTL_LOG("[ctl] device list (%u):", (unsigned)devs.size());
+        for (auto& d : devs) CTL_LOG(" %s=%s", d.name, ipStr(d.ip).c_str());
+        CTL_LOG("\n");
+      }
+    }
+#endif
   }
 
   void schedulePolls(uint32_t now) {
@@ -969,15 +998,17 @@ class ControllerUsermod : public Usermod {
       if (takeReq(r)) { doRequest(r); continue; }
       uint32_t now = millis();
       if (!lastMdns || now - lastMdns >= kMdnsMs) { lastMdns = now ? now : 1; scanMdns(); }
+      sweepStep(now);
       vTaskDelay(pdMS_TO_TICKS(30));
     }
   }
 
   // Returns true and fills `doc` when the device answered with HTTP 200 and valid JSON.
-  bool http(uint32_t ip, bool post, const char* path, const String& body, JsonDocument& doc, JsonDocument* filter) {
+  bool http(uint32_t ip, bool post, const char* path, const String& body, JsonDocument& doc, JsonDocument* filter,
+            uint16_t connectMs = 1500) {
     WiFiClient client;
     HTTPClient h;
-    h.setConnectTimeout(1500);
+    h.setConnectTimeout(connectMs);
     h.setTimeout(3000);
     h.setReuse(false);
     if (!h.begin(client, ipStr(ip), 80, path)) return false;
@@ -1069,19 +1100,89 @@ class ControllerUsermod : public Usermod {
     setReachable(r.ip, ok);
   }
 
+  // One probe of the unicast sweep, run between requests so control stays responsive. It runs regardless of what
+  // the node list or mDNS found: on an AP that delivers multicast only some of the time they return a partial
+  // list (or none), and nothing says how many devices to expect. A dead address costs one connect timeout, so a
+  // /24 pass takes about a minute and then idles for kSweepIdleMs.
+  void sweepStep(uint32_t now) {
+    if (!sweepHost) {
+      if (sweepDoneAt && now - sweepDoneAt < kSweepIdleMs) return;
+      sweepHost = 1;
+      Lock l(mtx);
+      for (auto& h : sweepHits) h.missed++;
+    }
+    const uint32_t self = (uint32_t)WLEDNetwork.localIP();
+    IPAddress base(self);
+    base[3] = (uint8_t)sweepHost;
+    const uint32_t ip = (uint32_t)base;
+    const uint8_t host = (uint8_t)sweepHost;
+    if (++sweepHost > 254) {
+      sweepHost = 0;
+      sweepDoneAt = now ? now : 1;
+      Lock l(mtx);
+      sweepHits.erase(std::remove_if(sweepHits.begin(), sweepHits.end(),
+                                     [](const MdnsHit& h) { return h.missed >= 2; }), sweepHits.end());
+      CTL_LOG("[ctl] sweep done: %u WLED found\n", (unsigned)sweepHits.size());
+    }
+    if (ip == self || host == 255) return;
+    {
+      Lock l(mtx);
+      for (auto& h : mdnsHits) if (h.ip == ip) return;   // already known through mDNS
+    }
+    StaticJsonDocument<64> filter;
+    filter["brand"] = true;
+    filter["name"] = true;
+    StaticJsonDocument<192> doc;
+    if (!http(ip, false, "/json/info", String(), doc, &filter, kSweepProbeMs)) return;
+    if (strcmp(doc["brand"] | "", "WLED") != 0) return;
+    MdnsHit hit{};
+    hit.ip = ip;
+    strlcpy(hit.name, doc["name"] | "", sizeof(hit.name));
+    Lock l(mtx);
+    for (auto& h : sweepHits) {
+      if (h.ip != ip) continue;
+      h.missed = 0;
+      strlcpy(h.name, hit.name, sizeof(h.name));
+      return;
+    }
+    if (sweepHits.size() < 16) {
+      sweepHits.push_back(hit);
+      CTL_LOG("[ctl] sweep found %s %s\n", hit.name, ipStr(ip).c_str());
+    }
+  }
+
   // mDNS finds WLED devices that have the node list broadcast turned off.
   void scanMdns() {
-    int n = MDNS.queryService("wled", "tcp");
-    std::vector<MdnsHit> hits;
+    const int n = MDNS.queryService("wled", "tcp");
+    std::vector<MdnsHit> seen;
     for (int i = 0; i < n && i < 16; i++) {
       MdnsHit h{};
       h.ip = (uint32_t)MDNS.address(i);
       if (!h.ip) continue;
       strlcpy(h.name, MDNS.hostname(i).c_str(), sizeof(h.name));
-      hits.push_back(h);
+      seen.push_back(h);
     }
     Lock l(mtx);
-    mdnsHits.swap(hits);
+    // One mDNS query is lossy (multicast has no retries, and a device at the edge of WiFi range misses some).
+    // Replacing the whole list each scan made such devices flicker out; instead merge, and drop a device only
+    // after it has been missed kMdnsMaxMissed scans in a row.
+    for (auto& old : mdnsHits) old.missed++;
+    for (auto& h : seen) {
+      bool known = false;
+      for (auto& old : mdnsHits) {
+        if (old.ip != h.ip) continue;
+        old.missed = 0;
+        strlcpy(old.name, h.name, sizeof(old.name));
+        known = true;
+        break;
+      }
+      if (!known && mdnsHits.size() < 16) mdnsHits.push_back(h);
+    }
+    mdnsHits.erase(std::remove_if(mdnsHits.begin(), mdnsHits.end(),
+                                  [](const MdnsHit& h) { return h.missed >= kMdnsMaxMissed; }),
+                   mdnsHits.end());
+    CTL_LOG("[ctl] mDNS: query=%d seen=%u kept=%u nodes=%u sweep=%u\n", n, (unsigned)seen.size(),
+            (unsigned)mdnsHits.size(), (unsigned)nodeCount, (unsigned)sweepHits.size());
   }
 };
 
