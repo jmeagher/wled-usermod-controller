@@ -74,7 +74,7 @@ enum Screen : uint8_t { SCR_MAIN, SCR_PICK_DEVICE, SCR_PICK_PRESET };
 enum Region : int8_t { R_NONE = -1, R_DEVICE, R_POWER, R_PRESET, R_BRI };
 enum TouchEv : uint8_t { T_DOWN, T_MOVE, T_UP };
 
-struct Preset { uint8_t id; char name[24]; };
+struct Preset { uint8_t id; char name[24]; bool scene; };
 
 struct Dev {
   uint32_t ip = 0;               // 0 = this device
@@ -105,7 +105,7 @@ struct Req {
 
 struct MdnsHit { uint32_t ip; char name[33]; uint8_t missed; };   // missed: consecutive scans that did not see it
 
-struct PickItem { char label[34]; char sub[20]; uint32_t ip; uint8_t id; bool current; };
+struct PickItem { char label[34]; char sub[20]; uint32_t ip; uint8_t id; bool current; bool header; };
 
 // RGB565 helper
 constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -563,6 +563,15 @@ class ControllerUsermod : public Usermod {
   }
 
   // --- local presets ------------------------------------------------------------------------
+  // Parse a preset from a JSON object and populate the Preset struct.
+  void parsePreset(JsonObject value, uint8_t id, Preset& p) {
+    p.id = id;
+    p.scene = ctl::isScene(value["playlist"].is<JsonObject>(), value["ql"] | "");
+    const char* n = value["n"] | "";
+    if (*n) strlcpy(p.name, n, sizeof(p.name));
+    else snprintf(p.name, sizeof(p.name), "Preset %d", id);
+  }
+
   void reloadLocalPresets() {
     if (!requestJSONBufferLock(JSON_LOCK_UNKNOWN)) { localPresetsDirty = true; return; }
     std::vector<Preset> list;
@@ -571,15 +580,12 @@ class ControllerUsermod : public Usermod {
         int id = atoi(kv.key().c_str());
         if (id <= 0 || id > 250) continue;
         Preset p{};
-        p.id = id;
-        const char* n = kv.value()["n"] | "";
-        if (*n) strlcpy(p.name, n, sizeof(p.name));
-        else snprintf(p.name, sizeof(p.name), "Preset %d", id);
+        parsePreset(kv.value().as<JsonObject>(), id, p);
         list.push_back(p);
       }
     }
     releaseJSONBufferLock();
-    std::sort(list.begin(), list.end(), [](const Preset& a, const Preset& b) { return a.id < b.id; });
+    ctl::orderPresets(list);
     Lock l(mtx);
     devs[0].presets.swap(list);
     devs[0].presetsLoaded = true;
@@ -660,6 +666,7 @@ class ControllerUsermod : public Usermod {
     int idx = pickFirst + (y - kPickTitleH) / kItemH;
     if (idx < 0 || idx >= int(pickItems.size())) return;
     const PickItem it = pickItems[idx];
+    if (it.header) return;              // ignore taps on header rows
     if (screen == SCR_PICK_DEVICE) {
       selIp = it.ip;
       lastPoll = 0;                    // poll the newly selected device on the next housekeeping pass
@@ -690,8 +697,42 @@ class ControllerUsermod : public Usermod {
       }
     } else {
       Dev& d = devs[si];
-      items.reserve(d.presets.size());
+      items.reserve(d.presets.size() + 2);  // +2 for potential header rows
+
+      // Count scenes to decide whether to show headers
+      size_t sceneCount = 0;
+      for (auto& p : d.presets) if (p.scene) sceneCount++;
+
+      // If there are scenes, emit headers
+      if (sceneCount > 0) {
+        // SCENES header
+        PickItem hdr{};
+        strlcpy(hdr.label, "SCENES", sizeof(hdr.label));
+        hdr.header = true;
+        items.push_back(hdr);
+
+        // Add scenes
+        for (auto& p : d.presets) {
+          if (!p.scene) continue;
+          PickItem it{};
+          snprintf(it.label, sizeof(it.label), "%s", p.name);
+          snprintf(it.sub, sizeof(it.sub), "scene %u", p.id);
+          it.id = p.id; it.current = p.id == d.ps;
+          items.push_back(it);
+        }
+
+        // PRESETS header, only when there are component presets to put under it
+        if (sceneCount < d.presets.size()) {
+          PickItem presetHdr{};
+          strlcpy(presetHdr.label, "PRESETS", sizeof(presetHdr.label));
+          presetHdr.header = true;
+          items.push_back(presetHdr);
+        }
+      }
+
+      // Add non-scene presets
       for (auto& p : d.presets) {
+        if (p.scene) continue;
         PickItem it{};
         snprintf(it.label, sizeof(it.label), "%s", p.name);
         snprintf(it.sub, sizeof(it.sub), "preset %u", p.id);
@@ -949,14 +990,28 @@ class ControllerUsermod : public Usermod {
       canvas->fillScreen(C_BG);
       if (idx < int(pickItems.size())) {
         const PickItem& it = pickItems[idx];
-        if (it.current) { canvas->fillRect(0, 0, kW, kItemH, C_CUR); canvas->fillRect(0, 0, 4, kItemH, C_ACCENT); }
-        canvas->setFont(&FreeSans9pt7b);
-        fitText(*canvas, it.label, 12, 18, kW - 24, C_TEXT);
-        canvas->setFont(nullptr);
-        canvas->setTextColor(C_DIM);
-        canvas->setCursor(12, 28);
-        canvas->print(it.sub);
-        canvas->drawFastHLine(0, kItemH - 1, kW, C_TRACK);
+        if (it.header) {
+          // Render header row: dim, small, centered separator style
+          canvas->setFont(nullptr);
+          canvas->setTextSize(1);
+          canvas->setTextColor(C_DIM);
+          int16_t x1, y1; uint16_t w, h;
+          canvas->getTextBounds(it.label, 0, 0, &x1, &y1, &w, &h);
+          int xc = (kW - int(w)) / 2;
+          canvas->setCursor(xc, 20);
+          canvas->print(it.label);
+          canvas->drawFastHLine(0, kItemH / 2 + 2, kW, C_DIM);
+        } else {
+          // Render regular item
+          if (it.current) { canvas->fillRect(0, 0, kW, kItemH, C_CUR); canvas->fillRect(0, 0, 4, kItemH, C_ACCENT); }
+          canvas->setFont(&FreeSans9pt7b);
+          fitText(*canvas, it.label, 12, 18, kW - 24, C_TEXT);
+          canvas->setFont(nullptr);
+          canvas->setTextColor(C_DIM);
+          canvas->setCursor(12, 28);
+          canvas->print(it.sub);
+          canvas->drawFastHLine(0, kItemH - 1, kW, C_TRACK);
+        }
       } else if (pickItems.empty() && i == 0) {
         canvas->setFont(&FreeSans9pt7b);
         fitText(*canvas, fetching ? "loading..." : "nothing here", 12, 26, kW - 24, C_DIM);
@@ -1073,8 +1128,13 @@ class ControllerUsermod : public Usermod {
     }
     if (r.presets) {
       DynamicJsonDocument resp(24576);   // ~70 bytes per preset (250 max)
-      StaticJsonDocument<64> filter;
+      // Each filter key takes a slot. 64 bytes held only n + playlist.ps; adding "ql" overflowed it, and ArduinoJson then
+      // silently drops the keys that did not fit, so scenes marked by a label never showed. Keep headroom and check.
+      StaticJsonDocument<256> filter;
       filter["*"]["n"] = true;
+      filter["*"]["playlist"]["ps"] = true;   // only its presence matters; "ps" is always set in a playlist
+      filter["*"]["ql"] = true;               // quick-load label: marks a plain preset as a scene
+      if (filter.overflowed()) CTL_LOG("[ctl] preset filter overflowed: scenes will be incomplete\n");
       bool got = resp.capacity() && http(r.ip, false, "/presets.json", String(), resp, &filter);
       std::vector<Preset> list;
       if (got) {
@@ -1082,13 +1142,10 @@ class ControllerUsermod : public Usermod {
           int id = atoi(kv.key().c_str());
           if (id <= 0 || id > 250) continue;
           Preset p{};
-          p.id = id;
-          const char* n = kv.value()["n"] | "";
-          if (*n) strlcpy(p.name, n, sizeof(p.name));
-          else snprintf(p.name, sizeof(p.name), "Preset %d", id);
+          parsePreset(kv.value().as<JsonObject>(), id, p);
           list.push_back(p);
         }
-        std::sort(list.begin(), list.end(), [](const Preset& a, const Preset& b) { return a.id < b.id; });
+        ctl::orderPresets(list);
       }
       Lock l(mtx);
       for (auto& d : devs) if (d.ip == r.ip) {

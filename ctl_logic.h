@@ -3,6 +3,7 @@
 #pragma once
 #include <algorithm>
 #include <stdint.h>
+#include <vector>
 
 namespace ctl {
 
@@ -48,6 +49,23 @@ inline void scrollList(int& first, int& accum, int dy, int itemH, int maxFirst) 
   while (accum <= -itemH) { first++; accum += itemH; }
   while (accum >= itemH)  { first--; accum -= itemH; }
   first = std::min(maxFirst, std::max(0, first));
+}
+
+// A preset is a "scene" (a complete look to pick, listed first) if WLED saved it as a playlist, or it carries a
+// non-empty quick-load label ("ql" in presets.json). WLED has no scene flag, and a plain preset like a device's boot
+// look is still a scene, so the label is the opt-in; helper presets that only feed a playlist leave it unset.
+inline bool isScene(bool hasPlaylist, const char* quickLoad) {
+  return hasPlaylist || (quickLoad && *quickLoad);
+}
+
+// Order a list of presets so scenes come first (by id), then the other presets (by id).
+// P needs `uint8_t id` and `bool scene`. Returns the number of scenes, which are the front group.
+template <class P> size_t orderPresets(std::vector<P>& list) {
+  std::sort(list.begin(), list.end(), [](const P& a, const P& b) {
+    if (a.scene != b.scene) return a.scene > b.scene;
+    return a.id < b.id;
+  });
+  return size_t(std::count_if(list.begin(), list.end(), [](const P& p) { return p.scene; }));
 }
 
 }  // namespace ctl

@@ -17,7 +17,7 @@ Main screen (portrait):
 |---|---|
 | Device row | tap: full-screen device list |
 | Power row | tap: toggle |
-| Preset row | tap: full-screen preset list |
+| Preset row | tap: full-screen preset list (scenes first, presets after) |
 | Brightness (bottom) | touch or drag anywhere in the area |
 
 The header shows the WiFi network name, the IP address and the number of devices found. For another device, the Power,
@@ -27,6 +27,12 @@ until then. The brightness bar fills in proportion to the level and shows the pe
 Lists: drag to scroll, tap an item to choose it, tap **X** (top right) to go back. The screen sleeps after 60 s (the
 touch that wakes it does nothing else); an open list closes after 20 s idle. The touch chip is also read while INT is held
 low and while the screen is dark, and is reset if it stops answering.
+
+The preset list puts "scenes" at the top under a SCENES header, followed by the other presets under a PRESETS header;
+both groups are sorted by ID. A scene is a WLED playlist, or any preset with a quick-load label (the short "QL" field in
+WLED's preset editor, `"ql"` in `presets.json`). Give the label to complete looks you want to pick and leave it off helper
+presets that only feed a playlist. Headers appear only when at least one scene exists and are not tappable.
+`../wled-usermod-ls-formula`'s device scripts set the label on their scenes.
 
 The local device works with no WiFi: power, presets and brightness call WLED directly. Other devices come from WLED's
 node list (UDP broadcasts, so *Sync > Show other WLED devices* must be on, which is the default) plus an mDNS scan for
