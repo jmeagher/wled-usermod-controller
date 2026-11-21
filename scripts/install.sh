@@ -5,7 +5,10 @@
 #   scripts/install.sh [build|flash|provision|all]      # default: all
 #   Board: Waveshare ESP32-C6-Touch-LCD-1.47 (8 MB) -> device "wled-touch". CTL_DEBUG=1 adds touch logging.
 #
-# Environment: CTL_DEBUG, NAME, PORT, LSF_DIR (the ls-formula checkout), WLED_DIR, STRIP (provision strip spec).
+# Environment: CTL_DEBUG, NAME, PORT, LSF_DIR (the ls-formula checkout), LSF_REF, WLED_DIR, STRIP (provision strip spec).
+#
+# The ls-formula usermod is linked from its checkout AS IT IS (branch, local edits and all): the build prints which
+# commit it used and warns about uncommitted changes. LSF_REF=<commit> makes the build refuse any other commit.
 # WiFi credentials come from $LSF_DIR/.wled.secrets (see the ls-formula Readme); never printed here.
 #
 # Why not just run c6-install.sh? Its build step regenerates platformio_override.ini from the ls-formula
@@ -22,14 +25,49 @@ action="${1:-all}"
 # touch SDA 18 / SCL 19 / RST 20 / INT 21), from Waveshare's docs and demo.
 base=esp32c6dev_8MB; name=wled-touch; env_name=touch_esp32c6_8MB
 default_strip="type=ws2812,order=grb,pin=7,len=50"   # GPIO 7 is the one header pin Waveshare documents as free
-board_flags="-D DATA_PINS=7 -D BTNPIN=-1 ${CTL_DEBUG:+-D CTL_DEBUG}"   # CTL_DEBUG=1: log touch events on the USB serial port
+# CTL_DEBUG=1: log touch events on the USB serial port. Only 1 turns it on (an unset, empty or 0 CTL_DEBUG does not).
+debug_flag=""
+case "${CTL_DEBUG:-0}" in
+  1) debug_flag="-D CTL_DEBUG" ;;
+  0|"") ;;
+  *) echo "CTL_DEBUG must be 0 or 1, got '$CTL_DEBUG'" >&2; exit 2 ;;
+esac
+board_flags="-D DATA_PINS=7 -D BTNPIN=-1${debug_flag:+ $debug_flag}"
 name="${NAME:-$name}"
 strip="${STRIP:-$default_strip}"
 
 [ -x "$lsf/board_setup/c6-install.sh" ] || { echo "ls-formula installer not found in $lsf (set LSF_DIR)" >&2; exit 1; }
 case "$dir/" in "$here"/*|"$lsf"/*) echo "WLED_DIR ($dir) must be outside both usermod trees" >&2; exit 2 ;; esac
 
+# Say which ls-formula commit goes into the firmware, and enforce LSF_REF when it is set.
+check_lsf() {
+  local head
+  head="$(git -C "$lsf" rev-parse HEAD 2>/dev/null)" || { echo "warning: $lsf is not a git checkout" >&2; return 0; }
+  echo "ls-formula usermod: $(git -C "$lsf" log -1 --format='%h %ad %s' --date=short)"
+  if [ -n "$(git -C "$lsf" status --porcelain 2>/dev/null)" ]; then
+    echo "warning: $lsf has uncommitted changes; they are built in" >&2
+  fi
+  if [ -n "${LSF_REF:-}" ]; then
+    local want
+    want="$(git -C "$lsf" rev-parse --verify -q "$LSF_REF^{commit}")" || { echo "LSF_REF $LSF_REF not found in $lsf" >&2; exit 1; }
+    [ "$head" = "$want" ] || { echo "ls-formula checkout is at ${head:0:12}, LSF_REF wants ${want:0:12}" >&2; exit 1; }
+  fi
+}
+
+# The web UI headers (wled00/html_ui.h etc.) are generated from the WLED tree. They used to be built only when missing,
+# so after a WLED_REF change the firmware carried the OLD UI. Rebuild them whenever the WLED commit differs from the
+# one they were generated for.
+build_ui() {
+  local stamp="$dir/.ctl-ui-built-for" head
+  head="$(git -C "$dir" rev-parse HEAD)"
+  if [ -f "$dir/wled00/html_ui.h" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$head" ]; then return 0; fi
+  echo "building the WLED web UI for ${head:0:12}"
+  (cd "$dir" && npm ci --silent && npm run build --silent)
+  echo "$head" > "$stamp"
+}
+
 build() {
+  check_lsf
   "$here/scripts/dev-setup.sh" >/dev/null   # pinned checkout (WLED_REF/WLED_DIR honoured)
   # The override carries both usermods. Each entry must sit on its own line (WLED reads it line by line).
   cat > "$dir/platformio_override.ini" <<INI
@@ -46,7 +84,8 @@ custom_usermods =
 build_flags = \${env:$base.build_flags}
   $board_flags
 INI
-  (cd "$dir" && { [ -f wled00/html_ui.h ] || { npm ci --silent && npm run build --silent; }; } && pio run -e "$env_name")
+  build_ui
+  (cd "$dir" && pio run -e "$env_name")
 }
 
 flash() {
