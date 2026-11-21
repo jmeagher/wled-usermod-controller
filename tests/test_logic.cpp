@@ -161,7 +161,59 @@ static void testInitTable() {
   CHECK(sawCol && sawRow);
 }
 
+// --- preset ordering ------------------------------------------------------------------------------------
+struct Preset { uint8_t id; bool scene; };
+
+static void testOrderPresetsEmpty() {
+  std::vector<Preset> list;
+  size_t count = ctl::orderPresets(list);
+  CHECK_EQ(count, 0);
+  CHECK_EQ(long(list.size()), 0);
+}
+
+static void testOrderPresetsNoPlaylists() {
+  std::vector<Preset> list = {{1, false}, {3, false}, {2, false}};
+  size_t count = ctl::orderPresets(list);
+  CHECK_EQ(count, 0);
+  CHECK_EQ(list.size(), 3);
+  CHECK_EQ(list[0].id, 1); CHECK(!list[0].scene);
+  CHECK_EQ(list[1].id, 2); CHECK(!list[1].scene);
+  CHECK_EQ(list[2].id, 3); CHECK(!list[2].scene);
+}
+
+static void testOrderPresetsOnlyPlaylists() {
+  std::vector<Preset> list = {{3, true}, {1, true}, {2, true}};
+  size_t count = ctl::orderPresets(list);
+  CHECK_EQ(count, 3);
+  CHECK_EQ(list.size(), 3);
+  CHECK_EQ(list[0].id, 1); CHECK(list[0].scene);
+  CHECK_EQ(list[1].id, 2); CHECK(list[1].scene);
+  CHECK_EQ(list[2].id, 3); CHECK(list[2].scene);
+}
+
+static void testOrderPresetsMixed() {
+  // Mixed ids: 1c, 2p, 3c, 4p, 10p. Expected: 2p, 4p, 10p, 1c, 3c. Return 3.
+  std::vector<Preset> list = {{1, false}, {2, true}, {3, false}, {4, true}, {10, true}};
+  size_t count = ctl::orderPresets(list);
+  CHECK_EQ(count, 3);
+  CHECK_EQ(list.size(), 5);
+  CHECK_EQ(list[0].id, 2); CHECK(list[0].scene);
+  CHECK_EQ(list[1].id, 4); CHECK(list[1].scene);
+  CHECK_EQ(list[2].id, 10); CHECK(list[2].scene);
+  CHECK_EQ(list[3].id, 1); CHECK(!list[3].scene);
+  CHECK_EQ(list[4].id, 3); CHECK(!list[4].scene);
+}
+
+static void testIsScene() {
+  CHECK(ctl::isScene(true, ""));       // playlist
+  CHECK(ctl::isScene(false, "BB"));    // plain preset with a quick-load label
+  CHECK(ctl::isScene(true, "HH"));
+  CHECK(!ctl::isScene(false, ""));     // helper preset
+  CHECK(!ctl::isScene(false, nullptr));
+}
+
 int main() {
+  testIsScene();
   testPercent();
   testFillIsProportional();
   testFillRadius();
@@ -171,6 +223,10 @@ int main() {
   testTouchClamps();
   testScroll();
   testInitTable();
+  testOrderPresetsEmpty();
+  testOrderPresetsNoPlaylists();
+  testOrderPresetsOnlyPlaylists();
+  testOrderPresetsMixed();
   if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
   std::printf("all logic tests passed\n");
   return 0;
