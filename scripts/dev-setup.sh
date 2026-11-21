@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch a pinned WLED checkout and point it at this working tree, ready to build.
 #
-#   scripts/dev-setup.sh                     # then: cd $dir && npm ci && npm run build && pio run -e ctl_esp32c6
+#   scripts/dev-setup.sh                     # then: cd $dir && npm ci && npm run build && pio run -e ctl_esp32c6_8MB
 #   WLED_REF=<sha-or-tag> scripts/dev-setup.sh
 #
 # Re-runnable. The checkout lives OUTSIDE this tree (default ~/.cache/wled-usermod-controller/wled, override
@@ -25,5 +25,5 @@ fi
 echo "WLED at $(git -C "$dir" log -1 --format='%h %ad %s' --date=short)"
 # PlatformIO resolves symlink:// to this working tree, so edits here are picked up by the next build.
 sed "s#__USERMOD_PATH__#$here#g" "$here/platformio_override.sample.ini" > "$dir/platformio_override.ini"
-echo "wrote $dir/platformio_override.ini (environments: ctl_esp32c6)"
-echo "next:  cd $dir && npm ci && npm run build && pio run -e ctl_esp32c6"
+echo "wrote $dir/platformio_override.ini (environments: ctl_esp32c6_8MB)"
+echo "next:  cd $dir && npm ci && npm run build && pio run -e ctl_esp32c6_8MB"

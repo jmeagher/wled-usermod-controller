@@ -1,6 +1,7 @@
 // Desktop tests for ctl_logic.h and the JD9853 init table. Build and run with tests/run.sh.
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "../ctl_logic.h"
@@ -139,6 +140,256 @@ static void testElapsed() {
   CHECK(ctl::elapsedMs(5000000, 5000000 - longest - 1, longest));
 }
 
+// --- redraw signatures ------------------------------------------------------------------------------------
+static void testHasher() {
+  CHECK_EQ(ctl::fnv1a("", 0), 2166136261u);
+  CHECK_EQ(ctl::fnv1a("a", 1), 0xe40c292cu);                 // published FNV-1a test vector
+  // Strings hash by content: what follows the terminator in the buffer does not matter.
+  char a[16], b[16];
+  memset(a, 'x', sizeof(a)); memset(b, 'y', sizeof(b));
+  strcpy(a, "Kitchen"); strcpy(b, "Kitchen");
+  CHECK_EQ(ctl::Hasher().str(a).h, ctl::Hasher().str(b).h);
+  // Field boundaries count: "ab"+"c" differs from "a"+"bc".
+  CHECK(ctl::Hasher().str("ab").str("c").h != ctl::Hasher().str("a").str("bc").h);
+  CHECK(ctl::Hasher().add(true).add(uint8_t(5)).h != ctl::Hasher().add(false).add(uint8_t(5)).h);
+  CHECK(ctl::Hasher().add(uint32_t(1)).h != ctl::Hasher().add(uint32_t(2)).h);
+}
+
+// --- network ----------------------------------------------------------------------------------------------
+static uint32_t ip4(int a, int b, int c, int d) { return uint32_t(a) << 24 | uint32_t(b) << 16 | uint32_t(c) << 8 | uint32_t(d); }
+// The device code passes IPAddress's raw value (first octet in the lowest byte); inSubnet must not care.
+static uint32_t raw4(int a, int b, int c, int d) { return uint32_t(d) << 24 | uint32_t(c) << 16 | uint32_t(b) << 8 | uint32_t(a); }
+
+static void testInSubnet() {
+  for (int order = 0; order < 2; order++) {
+    auto A = order ? raw4 : ip4;
+    const uint32_t self = A(192, 168, 1, 50), m24 = A(255, 255, 255, 0);
+    CHECK(ctl::inSubnet(A(192, 168, 1, 7), self, m24));
+    CHECK(!ctl::inSubnet(A(192, 168, 2, 7), self, m24));       // other subnet
+    CHECK(!ctl::inSubnet(A(8, 8, 8, 8), self, m24));           // off-LAN mDNS answer
+    CHECK(!ctl::inSubnet(self, self, m24));                    // this device
+    CHECK(!ctl::inSubnet(A(192, 168, 1, 0), self, m24));       // network address
+    CHECK(!ctl::inSubnet(A(192, 168, 1, 255), self, m24));     // broadcast
+    CHECK(!ctl::inSubnet(0, self, m24));
+    CHECK(!ctl::inSubnet(A(192, 168, 1, 7), self, 0));         // no mask: trust nothing
+    const uint32_t m22 = A(255, 255, 252, 0);
+    CHECK(ctl::inSubnet(A(192, 168, 3, 254), self, m22));      // a /22 spans .0.x to .3.x
+    CHECK(!ctl::inSubnet(A(192, 168, 3, 255), self, m22));     // its broadcast address
+    CHECK(ctl::inSubnet(A(192, 168, 0, 255), self, m22));
+    CHECK(!ctl::inSubnet(A(192, 168, 4, 1), self, m22));
+  }
+}
+
+static void testSweepRange() {
+  ctl::HostRange r = ctl::sweepRange(ip4(192, 168, 1, 50), ip4(255, 255, 255, 0));
+  CHECK_EQ(r.first, ip4(192, 168, 1, 1)); CHECK_EQ(r.count, 254);
+  r = ctl::sweepRange(ip4(10, 0, 5, 9), ip4(255, 255, 252, 0));            // /22: whole subnet
+  CHECK_EQ(r.first, ip4(10, 0, 4, 1)); CHECK_EQ(r.count, 1022);
+  r = ctl::sweepRange(ip4(10, 0, 5, 9), ip4(255, 255, 0, 0));              // /16: clamped to our /24
+  CHECK_EQ(r.first, ip4(10, 0, 5, 1)); CHECK_EQ(r.count, 254);
+  r = ctl::sweepRange(ip4(10, 1, 2, 3), 0);                                // no mask
+  CHECK_EQ(r.first, ip4(10, 1, 2, 1)); CHECK_EQ(r.count, 254);
+  r = ctl::sweepRange(ip4(10, 1, 2, 3), ip4(255, 0, 255, 0));              // not a prefix
+  CHECK_EQ(r.count, 254);
+  r = ctl::sweepRange(ip4(192, 168, 1, 130), ip4(255, 255, 255, 128));     // /25: only our half
+  CHECK_EQ(r.first, ip4(192, 168, 1, 129)); CHECK_EQ(r.count, 126);
+  r = ctl::sweepRange(ip4(192, 168, 1, 6), ip4(255, 255, 255, 252));       // /30
+  CHECK_EQ(r.first, ip4(192, 168, 1, 5)); CHECK_EQ(r.count, 2);
+  CHECK_EQ(ctl::sweepRange(ip4(192, 168, 1, 6), ip4(255, 255, 255, 254)).count, 0);   // /31
+  CHECK_EQ(ctl::sweepRange(ip4(192, 168, 1, 6), 0xFFFFFFFFu).count, 0);              // /32
+  CHECK_EQ(ctl::prefixLength(ip4(255, 255, 255, 0)), 24);
+  CHECK_EQ(ctl::prefixLength(0), 0);
+  CHECK_EQ(ctl::prefixLength(0xFFFFFFFFu), 32);
+  CHECK_EQ(ctl::prefixLength(ip4(255, 0, 255, 0)), -1);
+}
+
+static void testBusUse() {
+  CHECK_EQ(ctl::busUse(-1, -1, 18, 19), ctl::BUS_OWN);
+  CHECK_EQ(ctl::busUse(18, 19, 18, 19), ctl::BUS_SHARED);
+  CHECK_EQ(ctl::busUse(21, 22, 18, 19), ctl::BUS_CONFLICT);
+  CHECK_EQ(ctl::busUse(18, -1, 18, 19), ctl::BUS_CONFLICT);
+}
+
+// --- device list ------------------------------------------------------------------------------------------
+struct TDev {
+  uint32_t ip = 0; bool local = false; char name[33] = {}; bool on = false; bool stateKnown = false;
+  bool listed = true; bool dupName = false; int tag = 0;   // tag: stands in for state that must survive a rebuild
+};
+
+static ctl::DevCand cand(uint32_t ip, const char* name, bool hasOn = false, bool on = false) {
+  ctl::DevCand c; c.ip = ip; snprintf(c.name, sizeof(c.name), "%s", name); c.hasOn = hasOn; c.on = on; return c;
+}
+
+static std::vector<TDev> localOnly() {
+  std::vector<TDev> d(1);
+  d[0].local = true; strcpy(d[0].name, "self"); d[0].stateKnown = true;
+  return d;
+}
+
+static void testMergeSortsAndFilters() {
+  const uint32_t self = ip4(192, 168, 1, 50), mask = ip4(255, 255, 255, 0);
+  std::vector<TDev> devs = localOnly();
+  std::vector<ctl::DevCand> c = {cand(ip4(192, 168, 1, 9), "zeta", true, true), cand(ip4(192, 168, 1, 8), "Alpha"),
+                                 cand(ip4(192, 168, 1, 9), "zeta again"),   // same address from another source
+                                 cand(self, "me"), cand(ip4(10, 0, 0, 1), "elsewhere")};
+  ctl::mergeDevices(devs, c, 0, self, mask);
+  CHECK_EQ(devs.size(), 3);
+  CHECK(devs[0].local);
+  CHECK(!strcmp(devs[1].name, "Alpha"));
+  CHECK(!strcmp(devs[2].name, "zeta"));
+  CHECK(devs[2].on);                   // node list hint until the first poll
+  CHECK(!devs[1].dupName && !devs[2].dupName);
+}
+
+static void testMergeKeepsState() {
+  const uint32_t self = ip4(192, 168, 1, 50), mask = ip4(255, 255, 255, 0);
+  std::vector<TDev> devs = localOnly();
+  ctl::mergeDevices(devs, {cand(ip4(192, 168, 1, 9), "a")}, 0, self, mask);
+  devs[1].tag = 42; devs[1].stateKnown = true; devs[1].on = false;
+  ctl::mergeDevices(devs, {cand(ip4(192, 168, 1, 9), "a", true, true), cand(ip4(192, 168, 1, 3), "b")}, 0, self, mask);
+  CHECK_EQ(devs.size(), 3);
+  CHECK_EQ(devs[1].tag, 42);
+  CHECK(!devs[1].on);                  // known state is not overwritten by the node list hint
+}
+
+// Regression: the selected remote briefly missing from every source fell the selection back to THIS device.
+static void testMergeKeepsSelected() {
+  const uint32_t self = ip4(192, 168, 1, 50), mask = ip4(255, 255, 255, 0), sel = ip4(192, 168, 1, 9);
+  std::vector<TDev> devs = localOnly();
+  ctl::mergeDevices(devs, {cand(sel, "sel"), cand(ip4(192, 168, 1, 3), "other")}, sel, self, mask);
+  devs[ctl::findDevice(devs, sel)].tag = 7;
+  ctl::mergeDevices(devs, {cand(ip4(192, 168, 1, 3), "other")}, sel, self, mask);   // gone from discovery
+  int i = ctl::findDevice(devs, sel);
+  CHECK(i > 0);
+  CHECK(!devs[i].listed);
+  CHECK_EQ(devs[i].tag, 7);
+  CHECK(!strcmp(devs[i].name, "sel"));
+  ctl::mergeDevices(devs, {cand(ip4(192, 168, 1, 3), "other")}, 0, self, mask);     // not selected any more
+  CHECK_EQ(ctl::findDevice(devs, sel), -1);
+  ctl::mergeDevices(devs, {cand(sel, "sel")}, sel, self, mask);                    // back again
+  i = ctl::findDevice(devs, sel);
+  CHECK(i > 0 && devs[i].listed);
+  CHECK_EQ(ctl::findDevice(devs, 0), 0);
+}
+
+static void testMergeMarksDuplicateNames() {
+  const uint32_t self = ip4(192, 168, 1, 50), mask = ip4(255, 255, 255, 0);
+  std::vector<TDev> devs = localOnly();
+  ctl::mergeDevices(devs, {cand(ip4(192, 168, 1, 20), "WLED"), cand(ip4(192, 168, 1, 10), "wled"),
+                           cand(ip4(192, 168, 1, 5), "Desk"), cand(ip4(192, 168, 1, 30), "WLED")}, 0, self, mask);
+  CHECK_EQ(devs.size(), 5);
+  CHECK(!strcmp(devs[1].name, "Desk") && !devs[1].dupName);
+  for (int i = 2; i <= 4; i++) CHECK(devs[i].dupName);
+  CHECK(devs[2].ip < devs[3].ip && devs[3].ip < devs[4].ip);   // same name: by address
+}
+
+static void testHealth() {
+  uint8_t f = 0;
+  f = ctl::nextFails(f, false); CHECK(ctl::reachableAfter(f));     // one lost reply: still shown
+  f = ctl::nextFails(f, false); CHECK(!ctl::reachableAfter(f));    // two in a row: unreachable
+  f = ctl::nextFails(f, true);  CHECK(ctl::reachableAfter(f)); CHECK_EQ(f, 0);
+  f = 254; f = ctl::nextFails(f, false); f = ctl::nextFails(f, false); CHECK_EQ(f, 255);   // saturates
+}
+
+static void testPresetRetry() {
+  CHECK_EQ(ctl::presetRetryMs(0), 10000);
+  CHECK_EQ(ctl::presetRetryMs(1), 10000);
+  CHECK_EQ(ctl::presetRetryMs(2), 20000);
+  CHECK_EQ(ctl::presetRetryMs(3), 40000);
+  CHECK_EQ(ctl::presetRetryMs(20), 300000);
+  CHECK_EQ(ctl::presetRetryMs(255), 300000);
+}
+
+// --- worker queue -----------------------------------------------------------------------------------------
+struct TReq { uint32_t ip = 0; uint8_t power = 0; int16_t bri = -1, ps = -1; bool poll = false, presets = false; uint32_t briDueAt = 0; };
+
+static void testPickRequest() {
+  TReq q[4];
+  CHECK_EQ(ctl::pickRequest(q, 4, 1000), -1);
+  q[0].ip = 1; q[0].poll = true;
+  q[1].ip = 2; q[1].presets = true;
+  CHECK_EQ(ctl::pickRequest(q, 4, 1000), 0);                       // background work in slot order
+  q[2].ip = 3; q[2].power = 1;
+  CHECK_EQ(ctl::pickRequest(q, 4, 1000), 2);                       // a command jumps the queue
+  q[2] = TReq();
+  q[3].ip = 4; q[3].bri = 50; q[3].briDueAt = 2000;
+  CHECK_EQ(ctl::pickRequest(q, 4, 1000), 0);                       // brightness not due yet
+  CHECK_EQ(ctl::pickRequest(q, 4, 2000), 3);                       // due: before the polls
+  q[0] = TReq(); q[1] = TReq();
+  CHECK_EQ(ctl::pickRequest(q, 4, 1000), -1);
+  q[3].ps = 3;
+  CHECK_EQ(ctl::pickRequest(q, 4, 1000), 3);
+}
+
+// --- HTTP -------------------------------------------------------------------------------------------------
+static ctl::HttpHead parseHead(const char* s, size_t* consumed = nullptr) {
+  ctl::HttpHead h;
+  size_t i = 0;
+  while (s[i] && h.feed(s[i])) i++;
+  if (s[i]) i++;                       // the byte that finished the head
+  if (consumed) *consumed = i;
+  return h;
+}
+
+static void testHttpHead() {
+  size_t used = 0;
+  const char* ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\ncontent-LENGTH:  57 \r\n\r\n{\"on\":true}";
+  ctl::HttpHead h = parseHead(ok, &used);
+  CHECK_EQ(h.state, ctl::HttpHead::DONE);
+  CHECK_EQ(h.status, 200);
+  CHECK_EQ(h.contentLength, 57);
+  CHECK(!h.chunked);
+  CHECK(!strcmp(ok + used, "{\"on\":true}"));                   // the body starts right after the head
+  h = parseHead("HTTP/1.0 404 Not Found\n\n");                  // bare LF line ends
+  CHECK_EQ(h.state, ctl::HttpHead::DONE); CHECK_EQ(h.status, 404); CHECK_EQ(h.contentLength, -1);
+  h = parseHead("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n");
+  CHECK(h.chunked);
+  CHECK_EQ(parseHead("SSH-2.0-OpenSSH\r\n\r\n").state, ctl::HttpHead::BAD);
+  CHECK_EQ(parseHead("HTTP/1.1 2000 OK\r\n\r\n").state, ctl::HttpHead::BAD);
+  CHECK_EQ(parseHead("HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\n").state, ctl::HttpHead::BAD);
+  CHECK_EQ(parseHead("HTTP/1.1 200 OK\r\nContent-Length: 12x\r\n\r\n").state, ctl::HttpHead::BAD);
+  CHECK_EQ(parseHead("HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\n").state, ctl::HttpHead::BAD);
+  // a host that never ends its head is cut off at kMaxHead bytes, not read forever
+  ctl::HttpHead endless;
+  const char* line = "HTTP/1.1 200 OK\r\n";
+  for (const char* p = line; *p; p++) endless.feed(*p);
+  size_t fed = 0;
+  while (endless.feed('X') && fed < 100000) fed++;
+  CHECK_EQ(endless.state, ctl::HttpHead::BAD);
+  CHECK(fed < ctl::HttpHead::kMaxHead);
+  // an over-long header line is truncated, not overflowed (ASan would catch a write past `line`)
+  std::string longHdr = "HTTP/1.1 200 OK\r\nX-Long: " + std::string(1000, 'a') + "\r\nContent-Length: 3\r\n\r\n";
+  h = parseHead(longHdr.c_str());
+  CHECK_EQ(h.state, ctl::HttpHead::DONE); CHECK_EQ(h.contentLength, 3);
+}
+
+static void testBodyLimit() {
+  CHECK_EQ(ctl::bodyLimit(-1, 8192), 8192);          // no length: read to close, capped
+  CHECK_EQ(ctl::bodyLimit(100, 8192), 100);
+  CHECK_EQ(ctl::bodyLimit(8192, 8192), 8192);
+  CHECK_EQ(ctl::bodyLimit(8193, 8192), -1);          // too big: rejected unread
+  CHECK_EQ(ctl::bodyLimit(0, 8192), 0);
+}
+
+// --- touch reset ------------------------------------------------------------------------------------------
+static void testResetPulse() {
+  ctl::ResetPulse r;
+  CHECK(!r.busy());
+  CHECK_EQ(r.step(0), ctl::ResetPulse::NONE);
+  r.start(1000);
+  CHECK(r.busy());
+  CHECK_EQ(r.step(1100), ctl::ResetPulse::NONE);
+  CHECK_EQ(r.step(1200), ctl::ResetPulse::DRIVE_HIGH);   // 200 ms low
+  CHECK_EQ(r.step(1201), ctl::ResetPulse::NONE);
+  CHECK(r.busy());
+  CHECK_EQ(r.step(1499), ctl::ResetPulse::NONE);
+  CHECK_EQ(r.step(1500), ctl::ResetPulse::FINISHED);     // 300 ms to boot
+  CHECK(!r.busy());
+  r.start(0xFFFFFF00u);                                  // across the millis() wrap
+  CHECK_EQ(r.step(0xFFFFFF00u + 200), ctl::ResetPulse::DRIVE_HIGH);
+  CHECK_EQ(r.step(0xFFFFFF00u + 500), ctl::ResetPulse::FINISHED);
+}
+
 // --- JD9853 init table ------------------------------------------------------------------------------------
 struct Cmd { uint8_t cmd, n, delay5; const uint8_t* data; };
 
@@ -247,6 +498,20 @@ int main() {
   testOrderPresetsNoPlaylists();
   testOrderPresetsOnlyPlaylists();
   testOrderPresetsMixed();
+  testHasher();
+  testInSubnet();
+  testSweepRange();
+  testBusUse();
+  testMergeSortsAndFilters();
+  testMergeKeepsState();
+  testMergeKeepsSelected();
+  testMergeMarksDuplicateNames();
+  testHealth();
+  testPresetRetry();
+  testPickRequest();
+  testHttpHead();
+  testBodyLimit();
+  testResetPulse();
   if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
   std::printf("all logic tests passed\n");
   return 0;
