@@ -68,4 +68,10 @@ template <class P> size_t orderPresets(std::vector<P>& list) {
   return size_t(std::count_if(list.begin(), list.end(), [](const P& p) { return p.scene; }));
 }
 
+// True when more than `ms` milliseconds have passed since `since`, for millis() values that wrap at 2^32.
+// Signed on purpose: `since` may be a few ms NEWER than `now` (a callback stamped millis() after the loop captured
+// `now`). Unsigned `now - since` then wraps to ~4 billion and reads as "idle for 49 days": the screen woke by a touch
+// went straight back to sleep in the same millisecond.
+inline bool elapsedMs(uint32_t now, uint32_t since, uint32_t ms) { return int32_t(now - since) > int32_t(ms); }
+
 }  // namespace ctl

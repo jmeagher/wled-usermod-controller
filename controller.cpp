@@ -192,8 +192,8 @@ class ControllerUsermod : public Usermod {
     pollTouch(now);
 
     // Screen timeout; a list is also closed when left idle.
-    if (awake && screenTimeoutS && now - lastActivity > screenTimeoutS * 1000UL) sleepScreen();
-    if (screen != SCR_MAIN && now - lastActivity > kPickIdleMs) closePicker();
+    if (awake && screenTimeoutS && ctl::elapsedMs(now, lastActivity, screenTimeoutS * 1000UL)) sleepScreen();
+    if (screen != SCR_MAIN && ctl::elapsedMs(now, lastActivity, kPickIdleMs)) closePicker();
 
     if (now - lastHousekeeping >= 500) {   // device list, local state, polling
       lastHousekeeping = now;
@@ -410,7 +410,7 @@ class ControllerUsermod : public Usermod {
     CTL_LOG("[ctl] touch %s x=%d y=%d\n", ev == T_DOWN ? "down" : ev == T_MOVE ? "move" : "up", x, y);
     if (ev == T_DOWN) {
       const bool wasAwake = awake;
-      wake();
+      wake(now);
       tIgnore = !wasAwake;             // the touch that wakes the screen does nothing else
       tMoved = false; tSlider = false; tRegion = R_NONE; tAccum = 0;
       tStartX = x; tStartY = y;
@@ -598,8 +598,8 @@ class ControllerUsermod : public Usermod {
     statusUntil = now + ms;
   }
 
-  void wake() {
-    lastActivity = millis();
+  void wake(uint32_t now) {
+    lastActivity = now;
     if (!awake) { awake = true; digitalWrite(pinBl, HIGH); resetDrawCache(); CTL_LOG("[ctl] %lu screen wake\n", (unsigned long)millis()); }
   }
 
